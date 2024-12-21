@@ -1,92 +1,117 @@
 import numpy as np
 
+np.random.seed(42)
+
 
 class KalmanFilter(object):
-    def __init__(self, F: np.ndarray = None, H: np.ndarray = None,
-                 G: np.ndarray = None, Q: np.ndarray = None,
+    def __init__(self, T1: np.ndarray, T2: np.ndarray,
+                 D: np.ndarray, Q: np.ndarray = None,
                  R: np.ndarray = None, P: np.ndarray = None,
-                 x0: np.ndarray = None, bts: bool = False):
-        if (F is None or H is None):
-            raise ValueError("Set proper system dynamics.")
+                 z0: np.ndarray = None, bts: bool = False):
+        assert T1.shape[0] == T1.shape[1]
+        assert T1.shape[0] == T2.shape[0]
+        assert T1.shape[0] == D.shape[1]
 
-        self.n = F.shape[1]
-        self.m = H.shape[1]
+        self.z_size = T1.shape[1]
+        self.u_size = T2.shape[1]
+        self.x_size = D.shape[0]
 
-        self.F = F
-        self.H = H
-        self.G = 0 if G is None else G
-        self.Q = np.eye(self.n) if Q is None else Q
-        self.R = np.eye(self.n) if R is None else R
-        self.P = np.eye(self.n) if P is None else P
-        self.x = np.zeros((self.n, 1)) if x0 is None else x0
+        self.T1 = T1
+        self.T2 = T2
+        self.D = D
+        self.Q = np.eye(self.z_size) if Q is None else Q
+        self.R = np.eye(self.x_size) if R is None else R
+        self.P = np.eye(self.z_size) if P is None else P
+        z0 = np.ones(self.z_size) if z0 is None else z0
+        self.z = np.random.multivariate_normal(z0, self.P, size=1).squeeze(0)
 
         self.bts = bts
-        self.x_s = self.x
+        self.z_s = self.z
         self.P_s = self.P
+        self.G = np.dot(self.P, np.dot(self.T1.T, np.linalg.inv(self.P)))
 
-    def predict(self, u: np.ndarray = 0):
-        self.x = np.dot(self.F, self.x) + np.dot(self.G, u)
-        self.P = np.dot(np.dot(self.F, self.P), self.F.T) + self.Q
-        return self.x, self.P
+    def predict(self, u: np.ndarray):
+        # P (z_size, z_size)
+        # T1 (z_size, z_size)
+        # T2 (z_size, u_size)
+        # Q (z_size, z_size)
+        z = np.dot(self.T1, self.z) + np.dot(self.T2, u)
+        P = np.dot(np.dot(self.T1, self.P), self.T1.T) + self.Q
+        return z, P
 
-    def update(self, z: np.ndarray, u: np.ndarray = 0):
-        y = z - np.dot(self.H, self.x)
-        S = self.R + np.dot(self.H, np.dot(self.P, self.H.T))
-        K = np.dot(np.dot(self.P, self.H.T), np.linalg.inv(S))
-        self.x = self.x + np.dot(K, y)
-        I = np.eye(self.n)
-        I_K = I - np.dot(K, self.H)
-        self.P = np.dot(np.dot(I_K, self.P), I_K.T) + \
-                 np.dot(np.dot(K, self.R), K.T)
+    def update(self, x: np.ndarray, u: np.ndarray):
+        self.z, self.P = self.predict(u)
+
+        # D (x_size, z_size)
+        # P (z_size, z_size)
+        y = x - np.dot(self.D, self.z)
+        S = self.R + np.dot(self.D, np.dot(self.P, self.D.T))
+        K = np.dot(np.dot(self.P, self.D.T), np.linalg.inv(S))
+        self.z = self.z + np.dot(K, y)
+        self.P = self.P - np.dot(np.dot(K, S), K.T)
 
         if self.bts:
             self.bts_update(u)
 
-    def bts_update(self, u: np.ndarray = 0):
+    def bts_update(self, u: np.ndarray):
         z, P = self.predict(u)
-        G = np.dot(self.P, np.dot(self.F.T, np.linalg.inv(P)))
-        self.x_s = self.x + np.dot(G, np.dot(self.x_s - z))
-        self.P_s = self.P + np.dot(G, np.dot(self.P_s - P, G.T))
+        self.G = np.dot(self.P, np.dot(self.T1.T, np.linalg.inv(P)))
+        self.z_s = self.z + np.dot(self.G, self.z_s - z)
+        self.P_s = self.P + np.dot(self.G, np.dot(self.P_s - P, self.G.T))
 
 
-class EMAlgorithm:
-    def __init__(self, F: np.ndarray = None, H: np.ndarray = None,
-                 G: np.ndarray = None, Q: np.ndarray = None,
-                 R: np.ndarray = None, P: np.ndarray = None,
-                 x0: np.ndarray = None):
-        self.kf = KalmanFilter(F, H, G, Q, R, P, x0, bts=True)
+class Model(KalmanFilter):
+    def __init__(self, bts: bool = True, K: int = 10, **kwargs):
+        super(Model, self).__init__(**kwargs, bts=bts)
 
-    def E_step(self, z: np.ndarray, u: np.ndarray = 0):
-        self.kf.update(z, u)
+        self.K = K
+        self.Sigma = np.zeros_like(self.P)
+        self.Phi = np.zeros_like(self.P)
+        self.B = np.zeros_like(self.P)
+        self.C = np.zeros_like(self.P)
+        self.A = np.zeros_like(self.P)
+        self.F = np.zeros_like(self.P)
+        self.I = np.zeros_like(self.P)
+        self.Delta = np.zeros_like(self.P)
+
+    def E_step(self, x: np.ndarray, u: np.ndarray = None):
+        if u is None:
+            u = np.zeros((self.K, self.z_size, 1))
+
+        Z_K_s = [self.z_s]
+        P_K_s = [self.P_s]
+        G_k = [self.G]
+
+        for k in range(self.K):
+            self.update(x[k], u[k])
+
+            Z_K_s.append(self.z_s)
+            P_K_s.append(self.P_s)
+            G_k.append(self.G)
+
+        Z_K_s = np.array(Z_K_s)
+        P_K_s = np.array(P_K_s)
+        G_k = np.array(G_k)
+
+        self.Sigma = (np.sum(P_K_s[1:], axis=0) + np.einsum("ki,kj->ij", Z_K_s[1:],
+                                                       Z_K_s[1:])) / self.K
+        self.Phi = (np.sum(P_K_s[:-1], axis=0) + np.einsum("ki,kj->ij", Z_K_s[:-1],
+                                                      Z_K_s[:-1])) / self.K
+        self.B = np.einsum("kx,kz->xz", x, Z_K_s[1:]) / self.K
+        self.C = (np.einsum("kiz,kzj->ij", P_K_s[1:], G_k[:-1]) + np.einsum(
+            "ki,kj->ij", Z_K_s[1:], Z_K_s[:-1])) / self.K
+        self.A = np.einsum("kz,ku->zu", Z_K_s[1:], u) / self.K
+        self.F = np.einsum("kz,ku->zu", Z_K_s[:-1], u) / self.K
+        self.I = np.einsum("ki,kj->ij", u, u) / self.K
+        self.Delta = np.einsum("ki,kj->ij", x, x) / self.K
 
     def M_step(self):
-        pass
+        Q = 0.5 * self.K * np.trace(np.dot(np.linalg.inv(self.Q), self.Sigma - np.dot(self.T1.T, self.C) - np.dot(self.A, self.T2.T) - np.dot(self.T1, self.C.T) + np.dot(np.dot(self.T1, self.Phi), self.T1.T) + np.dot(np.dot(self.T1, self.F), self.T2.T) - np.dot(self.T2, self.A.T) + np.dot(np.dot(self.T2, self.F.T), self.T1.T) + np.dot(np.dot(self.T2, self.I), self.T2.T))) + 0.5 * self.K * np.trace(np.dot(np.linalg.inv(self.R), self.Delta) - np.dot(self.B, self.D.T) - np.dot(self.D, self.B.T) + np.dot(np.dot(self.D, self.Sigma), self.D.T))
+        # TODO minimization Q
+        return Q
 
+if __name__ == "__main__":
+    model = Model(T1=np.random.random((10, 10)), T2=np.random.random((10, 12)), D=np.random.random((13, 10)), K=20)
 
-def example():
-    dt = 1.0 / 60
-    F = np.array([[1, dt, 0], [0, 1, dt], [0, 0, 1]])
-    H = np.array([1, 0, 0]).reshape(1, 3)
-    Q = np.array([[0.05, 0.05, 0.0], [0.05, 0.05, 0.0], [0.0, 0.0, 0.0]])
-    R = np.array([0.5]).reshape(1, 1)
-
-    x = np.linspace(-10, 10, 100)
-    measurements = - (x ** 2 + 2 * x - 2) + np.random.normal(0, 2, 100)
-
-    kf = KalmanFilter(F=F, H=H, Q=Q, R=R, bts=False)
-    predictions = []
-
-    for z in measurements:
-        predictions.append(np.dot(H, kf.predict())[0])
-        kf.update(z)
-
-    import matplotlib.pyplot as plt
-    plt.plot(range(len(measurements)), measurements, label='Measurements')
-    plt.plot(range(len(predictions)), np.array(predictions),
-             label='Kalman Filter Prediction')
-    plt.legend()
-    plt.show()
-
-
-if __name__ == '__main__':
-    example()
+    model.E_step(np.zeros((20, 13)), np.zeros((20, 12)))
+    print(model.M_step())
